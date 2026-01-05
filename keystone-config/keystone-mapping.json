@@ -1,0 +1,74 @@
+[
+    {
+        "local": [
+            {
+                "user": {
+                    "name": "{0}",
+                    "domain": { "name": "federated_domain" }
+                },
+                "group": {
+                    "name": "grp_iot_admin",
+                    "domain": { "name": "federated_domain" }
+                }
+            }
+        ],
+        "remote": [
+            { "type": "OIDC-preferred_username" },
+            {
+                "type": "OIDC-groups",
+                "any_one_of": [
+                    "/KC_IOT_ADMIN",
+                    "KC_IOT_ADMIN"
+                ]
+            }
+        ]
+    },
+    {
+        "local": [
+            {
+                "user": {
+                    "name": "{0}",
+                    "domain": { "name": "federated_domain" }
+                },
+                "group": {
+                    "name": "grp_iot_manager",
+                    "domain": { "name": "federated_domain" }
+                }
+            }
+        ],
+        "remote": [
+            { "type": "OIDC-preferred_username" },
+            {
+                "type": "OIDC-groups",
+                "any_one_of": [
+                    "/KC_IOT_MANAGER",
+                    "KC_IOT_MANAGER"
+                ]
+            }
+        ]
+    },
+    {
+        "local": [
+            {
+                "user": {
+                    "name": "{0}",
+                    "domain": { "name": "federated_domain" }
+                },
+                "group": {
+                    "name": "grp_iot_user",
+                    "domain": { "name": "federated_domain" }
+                }
+            }
+        ],
+        "remote": [
+            { "type": "OIDC-preferred_username" },
+            {
+                "type": "OIDC-groups",
+                "any_one_of": [
+                    "/KC_IOT_USER",
+                    "KC_IOT_USER"
+                ]
+            }
+        ]
+    }
+]

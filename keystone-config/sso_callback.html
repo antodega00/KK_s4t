@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+  <title>Waiting for OpenStack Dashboard...</title>
+  <script type="text/javascript">
+    function submit() {
+      var element = document.getElementById("sso_form");
+      if (element) {
+        element.submit();
+      }
+    }
+    window.onload = submit;
+  </script>
+  </head>
+  <body>
+    <form id="sso_form" action="http://localhost/horizon/auth/websso/" method="post">
+      <input type="hidden" name="token" value="${token}" />
+    </form>
+    <p>Please wait while we redirect you to the OpenStack Dashboard...</p>
+  </body>
+</html>

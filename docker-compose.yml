@@ -1,0 +1,670 @@
+version: "3.8"
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    container_name: keycloak
+    restart: unless-stopped
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_PORT: 5432
+      KC_DB_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: password_keycloak
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: 8081
+    ports:
+      - "8081:8080"
+    networks:
+      - s4t
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: password_keycloak
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - s4t
+
+  ca_service:
+    image: debian:bookworm-slim
+    container_name: ca_service
+    networks:
+      - s4t
+    volumes:
+      - iotronic_ssl:/etc/ssl/iotronic
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        set -euo pipefail
+        echo "[INFO] Installazione di OpenSSL..."
+        apt-get update
+        apt-get install -y --no-install-recommends openssl ca-certificates
+        rm -rf /var/lib/apt/lists/*
+
+        echo "[INFO] Generazione della Root CA..."
+        install -d -m 755 /etc/ssl/iotronic
+        cd /etc/ssl/iotronic
+
+        openssl genrsa -out iotronic_CA.key 2048
+        openssl req -x509 -new -nodes -key iotronic_CA.key -sha256 -days 18250 \
+          -subj "/C=IT/O=iotronic" -out iotronic_CA.pem
+
+        echo "[INFO] Generazione della chiave privata e del certificato per Crossbar..."
+        openssl genrsa -out crossbar.key 2048
+        openssl req -new -key crossbar.key -subj "/C=IT/O=iotronic/CN=crossbar" -out crossbar.csr
+        openssl x509 -req -in crossbar.csr -CA iotronic_CA.pem -CAkey iotronic_CA.key -CAcreateserial -out crossbar.pem -days 18250 -sha256
+
+        echo "[INFO] Impostazione permessi certificati..."
+        chmod 600 iotronic_CA.key
+        chmod 644 crossbar.key crossbar.pem iotronic_CA.pem
+        chmod 755 /etc/ssl/iotronic
+        #chmod 640 iotronic_CA.key crossbar.key
+        #chmod 644 iotronic_CA.pem crossbar.pem
+        #chmod 755 /etc/ssl/iotronic
+
+        echo "[INFO] Certificati generati con successo."
+        tail -f /dev/null
+
+  crossbar:
+    image: crossbario/crossbar
+    container_name: crossbar
+    restart: unless-stopped
+    networks:
+      - s4t
+    volumes:
+      - iotronic_ssl:/node/.crossbar/ssl # Condiviso con iotronic-wstun
+      - crossbar_data:/node/.crossbar
+    ports:
+      - "8181:8181"
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        echo "[INFO] Attesa dei certificati..."
+
+        mkdir -p /node/.crossbar/ssl
+        chmod 755 /node /node/.crossbar        
+
+        while [ ! -f /node/.crossbar/ssl/crossbar.pem ] || [ ! -f /node/.crossbar/ssl/crossbar.key ]; do
+          sleep 2
+        done
+        echo "[INFO] Certificati trovati!"
+
+        chmod 640 /node/.crossbar/ssl/crossbar.key || true
+        chmod 644 /node/.crossbar/ssl/crossbar.pem /node/.crossbar/ssl/iotronic_CA.pem || true
+
+
+        echo "[INFO] Scrittura configurazione Crossbar..."
+        cat <<EOF > /node/.crossbar/config.json
+        {
+           "version": 2,
+           "controller": {},
+           "workers": [
+              {
+                 "type": "router",
+                 "realms": [
+                    {
+                       "name": "s4t",
+                       "roles": [
+                          {
+                             "name": "anonymous",
+                             "permissions": [
+                                {
+                                   "uri": "*",
+                                   "allow": {
+                                        "publish": true,
+                                        "subscribe": true,
+                                        "call": true,
+                                        "register": true
+                                    }
+                                }
+                             ]
+                          }
+                       ]
+                    }
+                 ],
+                 "transports": [
+                    {
+                        "type": "websocket",
+                        "endpoint": {
+                          "type": "tcp",
+                          "port": 8181,
+                          "tls": {
+                                "chain_certificates": ["/node/.crossbar/ssl/iotronic_CA.pem"],
+                                "key": "/node/.crossbar/ssl/crossbar.key",
+                                "certificate": "/node/.crossbar/ssl/crossbar.pem"
+                          }
+                        },
+                        "options":{
+                                "enable_webstatus": true,
+                                "fail_by_drop": true,
+                                "open_handshake_timeout": 5000,
+                                "close_handshake_timeout": 2000,
+                                "auto_ping_interval": 50000,
+                                "auto_ping_timeout": 10000,
+                                "auto_ping_size": 15
+                        }
+                    }
+                 ]
+              }
+           ]
+        }
+        EOF
+
+        echo "[INFO] Avvio di Crossbar..."
+        crossbar start
+
+  iotronic-wstun:
+    image: lucadagati/iotronic-wstun:latest
+    container_name: iotronic-wstun
+    restart: unless-stopped
+    networks:
+      - s4t
+    ports:
+      - "8080:8080"
+      - "50001-50100:50001-50100"
+    volumes:
+      - iotronic_ssl:/var/lib/iotronic/ssl
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -x  # DEBUG: Mostra i comandi eseguiti
+        echo "[INFO] Verifica permessi certificati..."
+        ls -l /var/lib/iotronic/ssl
+        while [ ! -e /var/lib/iotronic/ssl/iotronic_CA.pem ] || [ ! -e /var/lib/iotronic/ssl/crossbar.key ]; do
+          echo "[DEBUG] Certificati mancanti:"
+          ls -l /var/lib/iotronic/ssl
+          sleep 2
+        done
+
+        echo "[INFO] Certificati SSL trovati!"
+        ls -l /var/lib/iotronic/ssl
+
+        echo "[INFO] Avvio di iotronic-wstun..."
+        exec node /usr/local/lib/node_modules/@mdslab/wstun/bin/wstun.js -r -s 8080 --ssl=true --key=/var/lib/iotronic/ssl/iotronic_CA.key --cert=/var/lib/iotronic/ssl/iotronic_CA.pem
+  iotronic-db:
+    image: mariadb:focal
+    container_name: iotronic-db
+    restart: unless-stopped
+    networks:
+      - s4t
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - unime_iotronic_db_data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-punime" ]
+      interval: 10s
+      retries: 5
+      start_period: 40s
+      timeout: 5s
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        set -e
+
+        echo "Verifica inizializzazione del database..."
+        if [ ! -d "/var/lib/mysql/mysql" ]; then
+            echo "Inizializzazione del database in corso..."
+            mysql_install_db --user=mysql --ldata=/var/lib/mysql
+        fi
+
+        echo "Avvio di MariaDB..."
+        mysqld_safe --bind-address=0.0.0.0 \
+               --max_connections=4096 \
+               --collation-server=utf8_general_ci \
+               --character-set-server=utf8 \
+               --innodb-buffer-pool-size=1G \
+               --innodb-flush-log-at-trx-commit=1 \
+               --innodb-file-per-table=1 &
+        PID_MYSQL=$$!
+
+        echo "Attesa che MariaDB sia pronto..."
+        while ! mysqladmin ping -h "localhost" --silent; do
+            echo "MariaDB non ancora pronto. Controllo i log..."
+            sleep 2
+        done
+
+        echo "MariaDB è pronto. Verifica database..."
+
+        if mysql -uroot -p$${MYSQL_ROOT_PASSWORD} -e "USE $${MYSQL_DATABASE};" 2>/dev/null; then
+            echo "Il database '${MYSQL_DATABASE}' esiste già."
+        else
+            echo "Creazione del database e dell'utente..."
+            mysql -uroot -p$${MYSQL_ROOT_PASSWORD} <<EOF
+        CREATE DATABASE IF NOT EXISTS $${MYSQL_DATABASE};
+        CREATE USER IF NOT EXISTS '$${MYSQL_USER}'@'%' IDENTIFIED BY '$${MYSQL_PASSWORD}';
+        CREATE USER 'root'@'%' IDENTIFIED BY 'unime';
+        GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+        GRANT ALL PRIVILEGES ON keystone.* TO 'root'@'%';
+        GRANT ALL PRIVILEGES ON iotronic.* TO 'root'@'%';
+        GRANT ALL PRIVILEGES ON $${MYSQL_DATABASE}.* TO '$${MYSQL_USER}'@'%';
+        FLUSH PRIVILEGES;
+        EOF
+        fi
+
+        echo "MariaDB avviato correttamente!"
+        wait $$PID_MYSQL
+
+  rabbitmq:
+    image: rabbitmq:3.7-management
+    container_name: rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - s4t
+    healthcheck:
+      test: [ "CMD", "rabbitmqctl", "status" ]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+
+  rabbitmq-setup:
+    image: rabbitmq:3.7-management
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - s4t
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: >
+      echo 'Aspettando RabbitMQ...'; for i in {1..30}; do
+        if rabbitmqctl status; then
+          echo 'RabbitMQ è pronto!';
+          break;
+        fi
+        echo 'RabbitMQ non ancora pronto, riprovo in 5 secondi...';
+        sleep 5;
+      done; echo "Configurazione dell'utente openstack..."; rabbitmqctl add_user openstack unime; rabbitmqctl set_permissions openstack '.*' '.*' '.*'; rabbitmqctl set_user_tags openstack administrator; echo 'Utente openstack creato con successo.';
+
+  keystone:
+    image: salvospina/keystone-oidc:latest
+    container_name: keystone
+    restart: unless-stopped
+    depends_on:
+      iotronic-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    networks:
+      - s4t
+    environment:
+      ADMIN_PASS: ${ADMIN_PASS}
+      OS_USERNAME: ${OS_USERNAME}
+      OS_PASSWORD: ${OS_PASSWORD}
+      OS_PROJECT_NAME: ${OS_PROJECT_NAME}
+      OS_USER_DOMAIN_NAME: ${OS_USER_DOMAIN_NAME}
+      OS_PROJECT_DOMAIN_NAME: ${OS_PROJECT_DOMAIN_NAME}
+      OS_AUTH_URL: ${OS_AUTH_URL}
+      OS_IDENTITY_API_VERSION: ${OS_IDENTITY_API_VERSION}
+
+      KEYSTONE_DB_NAME: ${KEYSTONE_DB_NAME}
+      KEYSTONE_DB_USER: ${KEYSTONE_DB_USER}
+      KEYSTONE_DBPASS: ${KEYSTONE_DBPASS}
+
+      DB_HOST: ${DB_HOST}
+      RABBIT_PASS: ${RABBIT_PASS}
+      REGION_NAME: ${REGION_NAME}
+
+      DB_CONNECTION_STRING: ${DB_CONNECTION_KEYSTONE}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./keystone-config/keystone.conf:/etc/keystone/keystone.conf
+      - ./keystone-config/wsgi-keystone.conf:/etc/apache2/sites-enabled/keystone.conf
+      - ./keystone-config/keystone-mapping.json:/etc/keystone/keystone-mapping.json
+      - ./keystone-config/sso_callback.html:/etc/keystone/sso_callback.html
+      # - ./conf_keystone:/etc/keystone
+      - keystone_data:/var/lib/keystone
+      - /var/log/keystone:/var/log/keystone
+      - /var/log/keystone-api:/var/log/apache2
+    healthcheck:
+      test: [ "CMD", "test", "-f", "/tmp/keystone-setup-done" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    command: |
+      /bin/bash -c "
+      echo '[INFO] Modifico il file keystone.conf con la stringa di connessione';
+      sed -i \"s|^connection *=.*|connection = ${DB_CONNECTION_KEYSTONE}|\" /etc/keystone/keystone.conf;
+      echo '[INFO] Avvio della configurazione Keystone...';
+
+      echo '[INFO] Attesa del database Keystone...';
+      chown -R keystone:keystone /var/log/keystone
+      chmod 777 /var/log/keystone/keystone-manage.log;
+      export DB_CONNECTION_STRING=\"${DB_CONNECTION_KEYSTONE}\";
+      until mysql -h iotronic-db -uroot -punime -e 'SELECT 1' >/dev/null 2>&1; do
+          echo '[INFO] Database non ancora pronto, riprovo...';
+          sleep 5;
+      done;
+      echo '[INFO] Database pronto!';
+
+      echo '[INFO] Configurazione del database Keystone...';
+      mysql -u root -punime -h iotronic-db <<EOF
+      CREATE DATABASE IF NOT EXISTS keystone;
+      CREATE DATABASE IF NOT EXISTS iotronic;
+      CREATE USER IF NOT EXISTS 'keystone'@'%' IDENTIFIED BY 'unime';
+      CREATE USER IF NOT EXISTS 'iotronic'@'%' IDENTIFIED BY 'unime';
+      GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%';
+      GRANT ALL PRIVILEGES ON iotronic.* TO 'iotronic'@'%';
+      FLUSH PRIVILEGES;
+      EOF
+
+
+      echo '[INFO] Creazione delle cartelle per le chiavi Fernet e credenziali...';
+      mkdir -p /etc/keystone/fernet-keys;
+      mkdir -p /etc/keystone/credential-keys;
+      chmod 700 /etc/keystone/fernet-keys;
+      chmod 700 /etc/keystone/credential-keys;
+      chown -R keystone:keystone /etc/keystone;
+
+      echo '[INFO] Controllo chiavi Fernet...';
+      if [ ! -f /etc/keystone/fernet-keys/0 ]; then
+          echo '[INFO] Nessuna chiave Fernet trovata, eseguo fernet_setup...';
+          su -s /bin/sh -c 'keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone' keystone;
+      else
+          echo '[INFO] Chiavi Fernet già presenti, salto la generazione.';
+      fi
+
+      echo '[INFO] Controllo chiavi di credenziali crittografate...';
+      if [ ! -f /etc/keystone/credential-keys/0 ]; then
+          echo '[INFO] Nessuna chiave di credenziali trovata, eseguo credential_setup...';
+          su -s /bin/sh -c 'keystone-manage credential_setup --keystone-user keystone --keystone-group keystone' keystone;
+      else
+          echo '[INFO] Chiavi di credenziali già presenti, salto la generazione.';
+      fi
+
+      echo '[INFO] Sincronizzazione delle tabelle di Keystone...';
+      su -s /bin/sh -c 'keystone-manage db_sync' keystone;
+
+      echo '[INFO] Bootstrap di Keystone...';
+      su -s /bin/sh -c 'keystone-manage bootstrap --bootstrap-password s4t --bootstrap-admin-url http://keystone:5000/v3 --bootstrap-internal-url http://keystone:5000/v3 --bootstrap-public-url http://localhost:5000/v3 --bootstrap-region-id RegionOne' keystone;
+
+      echo '[INFO] Verifica e avvio di Apache...';
+      if ! pgrep -x "apache2" > /dev/null; then
+          echo '[INFO] Apache non è in esecuzione, lo avvio...';
+          exec apache2ctl -D FOREGROUND &
+      else
+          echo '[INFO] Apache è già in esecuzione.';
+      fi
+
+      echo '[INFO] Creazione dei servizi di Iotronic...';
+      su -s /bin/sh -c 'openstack project create --domain default --description \"Service Project\" service' keystone || true;
+      su -s /bin/sh -c 'openstack service create iot --name Iotronic' keystone || true;
+      echo '[INFO] Iotronic User Create...';
+      su -s /bin/sh -c 'openstack user create --password unime iotronic' keystone || true;
+
+      echo '[INFO] Iotronic roles...';
+      su -s /bin/sh -c 'openstack role add --project service --user iotronic admin' keystone || true;
+      su -s /bin/sh -c 'openstack role create admin_iot_project' keystone || true;
+      su -s /bin/sh -c 'openstack role create manager_iot_project' keystone || true;
+      su -s /bin/sh -c 'openstack role create user_iot' keystone || true;
+      su -s /bin/sh -c 'openstack role add --project service --user iotronic admin_iot_project' keystone || true;
+      su -s /bin/sh -c 'openstack role add --project admin --user admin admin_iot_project' keystone || true;
+
+      echo '[INFO] Iotronic endpoints...';
+      su -s /bin/sh -c 'openstack endpoint create --region RegionOne iot public http://iotronic-conductor:8812' keystone || true;
+      su -s /bin/sh -c 'openstack endpoint create --region RegionOne iot internal http://iotronic-conductor:8812' keystone || true;
+      su -s /bin/sh -c 'openstack endpoint create --region RegionOne iot admin http://iotronic-conductor:8812' keystone || true;
+      echo '[INFO] End of configuration!';
+
+      echo '[INFO] Configurazione Federazione Keycloak...';
+      openstack domain create federated_domain || true
+
+      # Creazione dei 3 gruppi distinti
+      openstack group create --domain federated_domain grp_iot_admin || true
+      openstack group create --domain federated_domain grp_iot_manager || true
+      openstack group create --domain federated_domain grp_iot_user || true
+
+      # Assegnazione dei ruoli specifici (RBAC) ai gruppi sul progetto admin
+      # Admin -> admin_iot_project
+      openstack role add --group grp_iot_admin --group-domain federated_domain --project admin --project-domain Default admin_iot_project || true
+      # Manager -> manager_iot_project
+      openstack role add --group grp_iot_manager --group-domain federated_domain --project admin --project-domain Default manager_iot_project || true
+      # User -> user_iot
+      openstack role add --group grp_iot_user --group-domain federated_domain --project admin --project-domain Default user_iot || true
+
+      # Identity Provider: il remote-id deve coincidere con l'issuer di Keycloak
+      openstack identity provider create keycloak --remote-id http://localhost:8081/realms/openstack || true
+
+      # Mapping Rules (assicurati di aver aggiornato il file keystone-mapping.json locale!)
+      openstack mapping create keycloak_mapping --rules /etc/keystone/keystone-mapping.json || true
+
+      openstack federation protocol create mapped --identity-provider keycloak --mapping keycloak_mapping || true
+
+      echo '[INFO] Setup completato.';
+      touch /tmp/keystone-setup-done;
+      exec tail -f /dev/null"
+
+  iotronic-conductor:
+    image: salvospina/iotronic-conductor
+    container_name: iotronic-conductor
+    restart: unless-stopped
+    depends_on:
+      iotronic-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      keystone:
+        condition: service_healthy
+    networks:
+      - s4t
+    environment:
+      # Credenziali DB Iotronic
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD2}
+      DB_HOST: ${DB_HOST}
+      IOTRONIC_DB_NAME: ${IOTRONIC_DB_NAME}
+      IOTRONIC_DB_USER: ${IOTRONIC_DB_USER}
+      IOTRONIC_DBPASS: ${IOTRONIC_DBPASS} # Stringa di connessione
+      DB_CONNECTION_STRING: ${DB_CONNECTION_STRING}
+
+      # Credenziali OpenStack
+      OS_AUTH_URL: ${OS_AUTH_URL}
+      OS_USERNAME: ${OS_USERNAME}
+      OS_PASSWORD: ${OS_PASSWORD}
+      OS_PROJECT_NAME: ${OS_PROJECT_NAME}
+      OS_USER_DOMAIN_NAME: ${OS_USER_DOMAIN_NAME}
+      OS_PROJECT_DOMAIN_NAME: ${OS_PROJECT_DOMAIN_NAME}
+    ports:
+      - "8812:8812"
+    volumes:
+      - ./conf_conductor:/etc/iotronic
+      - iotronic_logs:/var/log/iotronic
+    healthcheck:
+      test: [ "CMD", "test", "-f", "/tmp/conductor-setup-done" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    command: >
+      /bin/bash -c "
+        apt-get update && apt-get install -y mysql-client nano;
+        echo '[INFO] Attesa del database MySQL...';
+        until mysql -h iotronic-db -uiotronic -punime -e 'SELECT 1' >/dev/null 2>&1; do
+          echo '[INFO] Database non ancora pronto, riprovo...';
+          sleep 5;
+        done;
+        #cd /opt/build/iotronic/iotronic/db/sqlalchemy;
+        #alembic -c alembic.ini upgrade head;
+        iotronic-dbsync;
+        echo '[INFO] Configurazione dei permessi sui log...';
+        chown -R iotronic:iotronic /var/log/iotronic;
+        echo '[INFO] Avvio di Iotronic Conductor...';
+        echo '[INFO] End of configuration!';  
+
+        touch /tmp/conductor-setup-done;  
+        exec /usr/local/bin/startConductor"
+
+  iotronic-wagent:
+    image: lucadagati/iotronic-wagent:latest
+    hostname: wagent-main
+    container_name: iotronic-wagent
+    restart: unless-stopped
+    depends_on:
+      iotronic-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      iotronic-conductor:
+        condition: service_healthy
+    networks:
+      - s4t
+    environment:
+      # DB info
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD2}
+      DB_HOST: ${DB_HOST}
+
+      # Stringa di connessione
+      DB_CONNECTION_STRING: ${DB_CONNECTION_STRING}
+
+      # Credenziali OpenStack
+      OS_AUTH_URL: ${OS_AUTH_URL}
+      OS_USERNAME: ${OS_USERNAME}
+      OS_PASSWORD: ${OS_PASSWORD}
+      OS_PROJECT_NAME: ${OS_PROJECT_NAME}
+      OS_USER_DOMAIN_NAME: ${OS_USER_DOMAIN_NAME}
+      OS_PROJECT_DOMAIN_NAME: ${OS_PROJECT_DOMAIN_NAME}
+    volumes:
+      - ./conf_wagent:/etc/iotronic
+      - iotronic_logs:/var/log/iotronic
+    command: >
+      /bin/bash -c "
+        echo '[INFO] Configurazione dei permessi sui log...';
+        chown -R iotronic:iotronic /var/log/iotronic;
+        echo '[INFO] Avvio del Wagent...';
+        exec /usr/local/bin/iotronic-wamp-agent --config-file /etc/iotronic/iotronic.conf"
+
+  iotronic-ui:
+    image: salvospina/iotronic-ui-kk
+    container_name: iotronic-ui
+    restart: unless-stopped
+    depends_on:
+      iotronic-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - s4t
+    ports:
+      - "80:80"
+    volumes:
+      - iotronic-ui_logs:/var/log/apache2
+      - ./conf_ui:/etc/openstack-dashboard
+      - ./conf_ui/openstack_auth_utils.py:/usr/lib/python2.7/dist-packages/openstack_auth/utils.py
+
+  lightning-rod-1:
+    image: lucadagati/lrod:compose
+    container_name: lightning-rod-1
+    hostname: Board_1
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - s4t
+    ports:
+      - "1474:1474"
+    volumes:
+      - lr_var_1:/var/lib/iotronic
+      - lr_le_1:/etc/letsencrypt/
+      - lr_nginx_1:/etc/nginx
+      - lr_confs_1:/etc/iotronic/
+    stdin_open: true
+    tty: true
+    entrypoint: /bin/sh
+    command: >
+      -c "sed -i \"s|self\\.wstun_ip *= .*|self.wstun_ip = \\\"iotronic-wstun\\\"|\" /usr/local/lib/python3*/site-packages/iotronic_lightningrod/modules/service_manager.py && exec startLR"
+
+  lightning-rod-2:
+    image: lucadagati/lrod:compose
+    container_name: lightning-rod-2
+    hostname: Board_2
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - s4t
+    ports:
+      - "1475:1474"
+    volumes:
+      - lr_var_2:/var/lib/iotronic
+      - lr_le_2:/etc/letsencrypt/
+      - lr_nginx_2:/etc/nginx
+      - lr_confs_2:/etc/iotronic/
+    stdin_open: true
+    tty: true
+    entrypoint: /bin/sh
+    command: >
+      -c "sed -i \"s|self\\.wstun_ip *= .*|self.wstun_ip = \\\"iotronic-wstun\\\"|\" /usr/local/lib/python3*/site-packages/iotronic_lightningrod/modules/service_manager.py && exec startLR"
+
+  lightning-rod-3:
+    image: lucadagati/lrod:compose
+    container_name: lightning-rod-3
+    hostname: Board_3
+    restart: unless-stopped
+    privileged: true
+    networks:
+      - s4t
+    ports:
+      - "1476:1474"
+    volumes:
+      - lr_var_3:/var/lib/iotronic
+      - lr_le_3:/etc/letsencrypt/
+      - lr_nginx_3:/etc/nginx
+      - lr_confs_3:/etc/iotronic/
+    stdin_open: true
+    tty: true
+    entrypoint: /bin/sh
+    command: >
+      -c "sed -i \"s|self\\.wstun_ip *= .*|self.wstun_ip = \\\"iotronic-wstun\\\"|\" /usr/local/lib/python3*/site-packages/iotronic_lightningrod/modules/service_manager.py && exec startLR"
+
+networks:
+  s4t:
+    driver: bridge
+
+volumes:
+  db_data:
+  postgres_data:
+  keystone_data:
+  iotronic_logs:
+  iotronic-ui_logs:
+  crossbar_data:
+  ca_data:
+  iotronic_ssl:
+  unime_iotronic_db_data:
+  rabbitmq_data:
+  lr_var_1:
+  lr_le_1:
+  lr_nginx_1:
+  lr_confs_1:
+  lr_var_2:
+  lr_le_2:
+  lr_nginx_2:
+  lr_confs_2:
+  lr_var_3:
+  lr_le_3:
+  lr_nginx_3:
+  lr_confs_3:
