@@ -181,7 +181,7 @@ openstack identity provider create keycloak \
 
 ---
 
-## Technical Deep Dive: OIDC Network Architecture in Docker
+## OIDC Network Architecture in Docker
 
 A critical point in OIDC configuration between containers is the distinction between internal and external endpoints.
 
